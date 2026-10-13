@@ -8,6 +8,11 @@
 
 create extension if not exists postgis with schema extensions;
 
+-- Helpers used by RLS policies. This schema is not exposed through the Data API,
+-- so the security definer functions below cannot be called as RPCs.
+create schema if not exists private;
+grant usage on schema private to authenticated;
+
 -- ---------------------------------------------------------------------------
 -- Enums
 -- ---------------------------------------------------------------------------
@@ -111,7 +116,7 @@ create table public.blocks (
   check (blocker_id <> blocked_id)
 );
 
-create function public.is_blocked_between(a uuid, b uuid)
+create function private.is_blocked_between(a uuid, b uuid)
 returns boolean
 language sql
 stable
@@ -124,7 +129,7 @@ as $$
   );
 $$;
 
-create function public.is_discoverable(target uuid)
+create function private.is_discoverable(target uuid)
 returns boolean
 language sql
 stable
@@ -167,7 +172,7 @@ create table public.matches (
   check (user_a < user_b)
 );
 
-create function public.is_match_participant(m uuid)
+create function private.is_match_participant(m uuid)
 returns boolean
 language sql
 stable
@@ -313,7 +318,7 @@ create policy "read own or discoverable profiles" on public.profiles
   for select to authenticated
   using (
     user_id = (select auth.uid())
-    or (public.is_discoverable(user_id) and not public.is_blocked_between((select auth.uid()), user_id))
+    or (private.is_discoverable(user_id) and not private.is_blocked_between((select auth.uid()), user_id))
   );
 create policy "insert own profile" on public.profiles
   for insert to authenticated with check (user_id = (select auth.uid()));
@@ -327,7 +332,7 @@ create policy "read prompts of visible profiles" on public.profile_prompts
   for select to authenticated
   using (
     user_id = (select auth.uid())
-    or (public.is_discoverable(user_id) and not public.is_blocked_between((select auth.uid()), user_id))
+    or (private.is_discoverable(user_id) and not private.is_blocked_between((select auth.uid()), user_id))
   );
 create policy "manage own prompts" on public.profile_prompts
   for all to authenticated
@@ -341,8 +346,8 @@ create policy "read approved photos of visible profiles" on public.photos
     user_id = (select auth.uid())
     or (
       moderation_status = 'approved'
-      and public.is_discoverable(user_id)
-      and not public.is_blocked_between((select auth.uid()), user_id)
+      and private.is_discoverable(user_id)
+      and not private.is_blocked_between((select auth.uid()), user_id)
     )
   );
 create policy "insert own photos" on public.photos
@@ -371,15 +376,15 @@ create policy "read own swipes and likes received" on public.swipes
     or (
       target_id = (select auth.uid())
       and action in ('like', 'superlike')
-      and not public.is_blocked_between((select auth.uid()), swiper_id)
+      and not private.is_blocked_between((select auth.uid()), swiper_id)
     )
   );
 create policy "swipe on discoverable profiles" on public.swipes
   for insert to authenticated
   with check (
     swiper_id = (select auth.uid())
-    and public.is_discoverable(target_id)
-    and not public.is_blocked_between(swiper_id, target_id)
+    and private.is_discoverable(target_id)
+    and not private.is_blocked_between(swiper_id, target_id)
   );
 
 -- matches
@@ -393,7 +398,7 @@ create policy "participants close matches" on public.matches
 
 -- messages
 create policy "participants read messages" on public.messages
-  for select to authenticated using (public.is_match_participant(match_id));
+  for select to authenticated using (private.is_match_participant(match_id));
 create policy "participants send messages to open matches" on public.messages
   for insert to authenticated
   with check (
@@ -435,28 +440,38 @@ create policy "read own subscription" on public.subscriptions
   for select to authenticated using (user_id = (select auth.uid()));
 
 -- ---------------------------------------------------------------------------
--- Column privileges: verification, status, scores and moderation state are
--- server-owned and must never be writable by clients.
+-- Table privileges. anon gets nothing; authenticated gets only what RLS allows.
+-- Verification, status, scores and moderation state are server-owned and must
+-- never be writable by clients.
 -- ---------------------------------------------------------------------------
-revoke insert, update on public.profiles from authenticated;
+revoke all on all tables in schema public from anon, authenticated;
+revoke all on all functions in schema private from public, anon;
+grant execute on all functions in schema private to authenticated;
+grant all on all tables in schema public to service_role;
+
+grant select on
+  public.profiles, public.profile_prompts, public.photos, public.preferences, public.blocks,
+  public.swipes, public.matches, public.messages, public.reports, public.moderation_actions,
+  public.appeals, public.subscriptions
+  to authenticated;
+grant insert, update, delete on public.profile_prompts, public.preferences to authenticated;
+grant insert, delete on public.blocks to authenticated;
+grant insert on public.swipes to authenticated;
+grant delete on public.photos to authenticated;
+
 grant insert (user_id, display_name, birthdate, gender, intent, bio, job, school, height_cm, locale, location)
   on public.profiles to authenticated;
 grant update (display_name, bio, job, school, height_cm, locale, location, last_active_at)
   on public.profiles to authenticated;
 
-revoke insert, update on public.photos from authenticated;
 grant insert (user_id, storage_path, position) on public.photos to authenticated;
 
-revoke update on public.matches from authenticated;
 grant update (closed_at, closed_by, closed_reason) on public.matches to authenticated;
 
-revoke insert, update on public.messages from authenticated;
 grant insert (match_id, sender_id, body, media_path) on public.messages to authenticated;
 
-revoke insert, update on public.reports from authenticated;
 grant insert (reporter_id, target_id, reason, message_id, photo_id, note) on public.reports to authenticated;
 
-revoke insert, update on public.appeals from authenticated;
 grant insert (action_id, user_id, message) on public.appeals to authenticated;
 
 -- ---------------------------------------------------------------------------
@@ -471,6 +486,9 @@ on conflict (id) do nothing;
 create policy "owners upload to their folder" on storage.objects
   for insert to authenticated
   with check (bucket_id = 'profile-photos' and (storage.foldername(name))[1] = (select auth.uid())::text);
+create policy "owners read their files" on storage.objects
+  for select to authenticated
+  using (bucket_id = 'profile-photos' and (storage.foldername(name))[1] = (select auth.uid())::text);
 create policy "owners delete their files" on storage.objects
   for delete to authenticated
   using (bucket_id = 'profile-photos' and (storage.foldername(name))[1] = (select auth.uid())::text);
